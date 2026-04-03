@@ -19,8 +19,25 @@ st.set_page_config(
 # ============================================================================
 # 常量
 # ============================================================================
-VIDEO_DIR = None  # 部署版不含视频文件
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_DIR = None
+
+def get_results_dir():
+    """根据 session state 中的结果集选择返回对应目录"""
+    batch = st.session_state.get("result_batch", "results1")
+    return os.path.join(BASE_DIR, batch)
+
+def scan_result_batches():
+    """扫描所有 results* 目录"""
+    batches = []
+    for name in sorted(os.listdir(BASE_DIR)):
+        if name.startswith("results") and os.path.isdir(os.path.join(BASE_DIR, name)):
+            # 跳过软链
+            full = os.path.join(BASE_DIR, name)
+            if os.path.islink(full):
+                continue
+            batches.append(name)
+    return batches
 
 
 # ============================================================================
@@ -31,6 +48,7 @@ def init_state():
         ("results", None),
         ("outline_idx", 0),
         ("detail_idx", 0),
+        ("result_batch", "results1"),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -47,7 +65,7 @@ def fmt(seconds):
 
 
 def load_results(group_id, project="tpn01"):
-    path = os.path.join(RESULTS_DIR, f"group{group_id}_{project}_result.json")
+    path = os.path.join(get_results_dir(), f"group{group_id}_{project}_result.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -55,11 +73,11 @@ def load_results(group_id, project="tpn01"):
 
 
 def scan_projects():
-    if not os.path.isdir(RESULTS_DIR):
+    if not os.path.isdir(get_results_dir()):
         return {}
     import re
     projects = {}
-    for fname in os.listdir(RESULTS_DIR):
+    for fname in os.listdir(get_results_dir()):
         m = re.match(r'group(\d+)_(.+)_result\.json$', fname)
         if m:
             projects.setdefault(m.group(2), []).append(int(m.group(1)))
@@ -238,6 +256,19 @@ def render_sidebar():
     with st.sidebar:
         st.markdown("### 视频剧本拆解实验室")
 
+        # 结果集切换
+        batches = scan_result_batches()
+        if batches:
+            def on_batch_change():
+                st.session_state.result_batch = st.session_state._batch_select
+                st.session_state.results = None
+
+            current_idx = batches.index(st.session_state.result_batch) if st.session_state.result_batch in batches else 0
+            st.selectbox("结果集", batches, index=current_idx, key="_batch_select", on_change=on_batch_change)
+            st.caption(f"当前: {st.session_state.result_batch} ({len(os.listdir(get_results_dir()))} 文件)")
+
+        st.markdown("---")
+
         projects = scan_projects()
         if not projects:
             st.info("results/ 下无结果文件")
@@ -293,7 +324,7 @@ def show_comparison_dialog():
     for p in projects:
         data[p] = {}
         for g in all_groups:
-            path = os.path.join(RESULTS_DIR, f"group{g}_{p}_result.json")
+            path = os.path.join(get_results_dir(), f"group{g}_{p}_result.json")
             if os.path.exists(path):
                 with open(path, 'r', encoding='utf-8') as f:
                     data[p][g] = json.load(f)
@@ -402,36 +433,67 @@ def show_comparison_dialog():
         rows5.append(row)
     st.table(rows5)
 
-    st.markdown("#### 覆盖率分析")
-    st.markdown("""
-- **大纲覆盖率普遍 85-98%** — 各组都能覆盖绝大部分视频时长，差异较小
-- **细纲覆盖率差异显著** — 这是区分实验组优劣的关键指标：
-  - **G0 对照组和 G5 Qwen Plus 细纲覆盖最稳定**（70-90%），得益于零失败率
-  - **G2 K-means 主导在 sgyy01/yxzt01 上细纲覆盖仅 25-27%**，因后半段大面积细纲生成失败
-  - **G3 自由推演波动大** — tpn02 仅 66%，存在 280s 的连续空洞
-  - **G4 Qwen Flash 的 yxzt01 细纲覆盖 35%**，虽然 gap 总量小但大量大纲本身无细纲
-- **所有组共有的 gap** — 如 tpn01 的 892-952s、sgyy01 的 544-628s，属于视频中的广告/片花/无台词段，是输入数据本身的空白
-    """)
+    # 动态生成分析结论
+    st.markdown(f"#### 分析结论（{st.session_state.result_batch}）")
 
-    st.markdown("#### 失败原因分析")
-    st.markdown("""
-- **33 个失败中 30 个为 LLM 输出 JSON 解析失败**（模型返回了非标准 JSON），3 个为 ID 幻觉（Qwen Flash 输出了超出时间线范围的 ID）
-- **非工程 Bug** — Pipeline 本身的重试、JSON 修复机制已生效，失败均为模型在 5 次重试后仍无法输出合规 JSON
-- **G0 和 G5 零失败** — 对照组 prompt 结构简单，Qwen Plus 的 JSON 遵从度最高
-- **G2 失败集中在后半段** — 视觉主导 prompt 在长视频后段累积误差，模型更易输出格式错误
-    """)
+    # 统计各组失败数和平均颗粒度
+    group_stats = {}
+    for g in all_groups:
+        total_outlines = 0
+        total_scenes = 0
+        total_failed = 0
+        total_projects = 0
+        for p in projects:
+            if g in data[p]:
+                r = data[p][g]
+                total_outlines += r['total_outlines']
+                total_scenes += r['total_scenes']
+                total_failed += sum(1 for o in r['outlines'] if not o.get('scene_details'))
+                total_projects += 1
+        if total_projects > 0:
+            group_stats[g] = {
+                'avg_outlines': total_outlines / total_projects,
+                'avg_scenes': total_scenes / total_projects,
+                'total_failed': total_failed,
+                'projects': total_projects,
+            }
 
-    st.markdown("#### 核心结论")
-    st.markdown("""
-1. **K-means 关键帧显著提升颗粒度** — G1/G2/G3 相比 G0，大纲和细纲数量均翻倍
-2. **G1（ASR 主导 + Gemini）综合最优** — 颗粒度最细、命名最准确
-3. **G5（ASR 主导 + Qwen Plus）稳定性最佳** — 5 个项目零失败，颗粒度适中
-4. **G2（K-means 主导）能捕捉画面转场但不稳定** — sgyy01/yxzt01 后半段大面积失败
-5. **G3（自由推演）有创造性但不可控** — 命名偏文学化，偶尔脱离实际内容
-6. **G4（Qwen Flash）明显不足** — 颗粒度最粗，yxzt01 几乎完全失效
-7. **同 Prompt 下 Gemini 3.1 Pro > Qwen Plus > Qwen Flash** — G1 vs G5 vs G4 的直接对比
-    """)
-    st.caption("模型：Gemini 3.1 Pro Preview (G0-G3) / Qwen 3.5 Omni Flash (G4) / Qwen 3.5 Omni Plus (G5)")
+    # 找出颗粒度最细和最粗的组
+    if group_stats:
+        best_g = max(group_stats, key=lambda g: group_stats[g]['avg_scenes'])
+        worst_g = min(group_stats, key=lambda g: group_stats[g]['avg_scenes'])
+        zero_fail = [group_labels[g] for g in group_stats if group_stats[g]['total_failed'] == 0]
+        total_fail = sum(s['total_failed'] for s in group_stats.values())
+
+        lines = []
+        lines.append(f"- **总失败数: {total_fail}**（{len(all_groups)} 组 x {len(projects)} 项目 = {len(all_groups)*len(projects)} 次实验）")
+        if zero_fail:
+            lines.append(f"- **零失败组**: {', '.join(zero_fail)}")
+        lines.append(f"- **颗粒度最细**: {group_labels[best_g]}（平均 {group_stats[best_g]['avg_outlines']:.0f} 大纲 / {group_stats[best_g]['avg_scenes']:.0f} 细纲）")
+        lines.append(f"- **颗粒度最粗**: {group_labels[worst_g]}（平均 {group_stats[worst_g]['avg_outlines']:.0f} 大纲 / {group_stats[worst_g]['avg_scenes']:.0f} 细纲）")
+
+        # 对比 G0 vs 其他组
+        if 0 in group_stats:
+            g0_avg = group_stats[0]['avg_scenes']
+            for g in [1, 2, 3]:
+                if g in group_stats:
+                    ratio = group_stats[g]['avg_scenes'] / g0_avg if g0_avg > 0 else 0
+                    if ratio > 1.3:
+                        lines.append(f"- **{group_labels[g]} vs G0 对照**: 细纲数量为对照组的 {ratio:.1f} 倍，K-means 关键帧有效提升颗粒度")
+                        break
+
+        # Gemini vs Qwen 对比 (G1 vs G5 vs G4)
+        for ga, gb in [(1, 5), (5, 4)]:
+            if ga in group_stats and gb in group_stats:
+                sa = group_stats[ga]['avg_scenes']
+                sb = group_stats[gb]['avg_scenes']
+                fa = group_stats[ga]['total_failed']
+                fb = group_stats[gb]['total_failed']
+                lines.append(f"- **{group_labels[ga]} vs {group_labels[gb]}**: 细纲 {sa:.0f} vs {sb:.0f}，失败 {fa} vs {fb}")
+
+        st.markdown("\n".join(lines))
+
+    st.caption("模型: Gemini 3.1 Pro Preview (G0-G3) / Qwen 3.5 Omni Flash (G4) / Qwen 3.5 Omni Plus (G5)")
 
 
 # ============================================================================
@@ -511,7 +573,7 @@ def main():
                 start_sec = int(current_detail.get("start_time", 0))
 
         if start_sec > 0:
-            st.caption(f"视频定位: {fmt(start_sec)} (部署版不含视频文件)")
+            st.caption(f"视频定位: {fmt(start_sec)}（部署版不含视频文件）")
         else:
             st.caption("选择细纲可定位对应时间段")
 
